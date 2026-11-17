@@ -2,6 +2,7 @@
  * Shared combo (model combo) handling with fallback support
  */
 
+import { createComboScorecard } from "./comboScorecard.mjs";
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
@@ -463,6 +464,7 @@ export async function handleComboChat({
     }
   }
   
+  const scorecard = createComboScorecard();
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
@@ -470,6 +472,7 @@ export async function handleComboChat({
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
+    scorecard?.start(modelStr);
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
@@ -489,6 +492,8 @@ export async function handleComboChat({
           // longer be streamed. Returning `result` would hand the client a locked, unreadable
           // body. Degrade to a clean, valid (empty) SSE stream instead.
           log.warn("COMBO", `empty-peek error on ${modelStr}, returning empty SSE: ${peekErr?.message || peekErr}`);
+          scorecard?.attempt(modelStr, "error");
+          scorecard?.finish("unknown", modelStr);
           return new Response("data: [DONE]\n\n", {
             status: 200,
             headers: { "Content-Type": "text/event-stream" },
@@ -509,6 +514,7 @@ export async function handleComboChat({
                   if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
                     clearStickyComboSession(comboName, sessionId);
                   }
+                  scorecard?.attempt(modelStr, "empty", result.status);
                   lastError = "Zero usable content";
                   lastStatus = 200;
                   continue;
@@ -520,11 +526,15 @@ export async function handleComboChat({
           }
 
           log.info("COMBO", `Model ${modelStr} succeeded`);
+          scorecard?.attempt(modelStr, "selected", result.status);
+          scorecard?.finish("unknown", modelStr);
           return result;
         }
 
         if (peeked.outcome === "content") {
           log.info("COMBO", `Model ${modelStr} succeeded${peeked.timedOut ? " (peek deadline; committed)" : ""}`);
+          scorecard?.attempt(modelStr, "selected", result.status);
+          scorecard?.finish("unknown", modelStr);
           return peeked.response;
         }
 
@@ -535,9 +545,12 @@ export async function handleComboChat({
         const isLast = i === rotatedModels.length - 1;
         if (isNoRetryFinish(peeked.finishReason) || isLast) {
           log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — ${isNoRetryFinish(peeked.finishReason) ? "no-retry class" : "last candidate"}, returning as-is`);
+          scorecard?.attempt(modelStr, "selected", result.status);
+          scorecard?.finish("unknown", modelStr);
           return peeked.response;
         }
 
+        scorecard?.attempt(modelStr, "empty", result.status);
         log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — falling through to next candidate`);
         if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
           clearStickyComboSession(comboName, sessionId);
@@ -548,6 +561,8 @@ export async function handleComboChat({
         if (!lastStatus) lastStatus = 502;
         continue;
       }
+
+      scorecard?.attempt(modelStr, "error", result.status);
 
       // If the model that failed was the session-sticky model, clear it so next turns re-evaluate
       if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
@@ -581,6 +596,7 @@ export async function handleComboChat({
 
       if (!shouldFallback && !requestScoped) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
+        scorecard?.finish("error", modelStr);
         return result;
       }
 
@@ -613,6 +629,7 @@ export async function handleComboChat({
       if (!lastStatus) lastStatus = result.status;
       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
     } catch (error) {
+      scorecard?.attempt(modelStr, "error");
       // Catch unexpected exceptions to ensure fallback continues
       if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
         clearStickyComboSession(comboName, sessionId);
@@ -622,6 +639,8 @@ export async function handleComboChat({
       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
     }
   }
+
+  scorecard?.finish("error");
 
   // At least one member rejected the request itself. Hand back that member's own
   // response — status and body — rather than the synthesized envelope below: the
